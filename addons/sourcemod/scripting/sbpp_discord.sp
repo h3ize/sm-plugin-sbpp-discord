@@ -1,232 +1,406 @@
 #pragma semicolon 1
 
-#undef REQUIRE_PLUGIN
-#tryinclude <sourcebanspp>
-#tryinclude <sourcebanschecker>
-#tryinclude <sourcecomms>
-#define REQUIRE_PLUGIN
+#define PLUGIN_AUTHOR "RumbleFrog, SourceBans++ Dev Team, heize"
+#define PLUGIN_VERSION "2"
 
-#define PLUGIN_NAME "Sourcebans_Discord"
-#define STEAM_API_CVAR "sbpp_steam_api"
-
-#include <RelayHelper>
-#include <calladmin>
-#include <clients>
-#include <colorvariables>
-#include <discordWebhookAPI>
-#include <sourcebanschecker>
 #include <sourcemod>
+#include <sourcebanspp>
+#include <sourcecomms>
+#include <SteamWorks>
+#include <smjansson>
+#include <calladmin>
 
 #pragma newdecls required
 
-Global_Stuffs g_Sbpp;
+enum
+{
+	Ban,
+	Report,
+	Comms,
+	CallAdmin,
+	Type_Count,
+	Type_Unknown,
+};
+
+int EmbedColors[Type_Count] = {
+	0xDA1D87, // Ban
+	0xF9D942, // Report
+	0x4362FA, // Comms
+	0xff0000, // CallAdmin
+};
+
+ConVar Convars[Type_Count],
+	Username,
+	ProfilePictureURL,
+	WebsiteBaseURL,
+	CallAdminMention,
+	CallAdminUsername,
+	CallAdminEmbedColor;
+
+char sEndpoints[Type_Count][256],
+	sHostname[64],
+	sHost[64];
 
 public Plugin myinfo =
 {
-	name 		= PLUGIN_NAME,
-	author 		= ".Rushaway, Dolly, koen, Sarrus, heize",
-	version 	= "1.0.1",
-	description = "Send Sourcebans Punishments and CallAdmin notifications to Discord",
-	url 		= "https://nide.gg, https://heizemod.us"
+	name = "SourceBans++ Discord Plugin",
+	author = PLUGIN_AUTHOR,
+	description = "Listens for ban, report, comms, and calladmin forward and sends it to webhook endpoints",
+	version = PLUGIN_VERSION,
+	url = "https://sbpp.github.io"
 };
 
-ConVar g_cvWebhookURL;
-ConVar g_cvMention;
-ConVar g_cvBotUsername;
-ConVar g_cvEmbedCallColor;
-ConVar g_cvHostname;
-ConVar g_cvIP;
-ConVar g_cvPort;
-
-char g_szHostname[256];
-char g_szIP[32];
-char g_szPort[32];
-
-bool g_bDebugging = false;
-
-public void OnPluginStart() {
-	g_Sbpp.enable 	= CreateConVar("sbpp_discord_enable", "1", "Toggle sourcebans notification system", _, true, 0.0, true, 1.0);
-	g_Sbpp.webhook 	= CreateConVar("sbpp_discord", "", "The webhook URL of your Discord channel. (Sourcebans)", FCVAR_PROTECTED);
-	g_Sbpp.website	= CreateConVar("sbpp_website", "", "Your sourcebans link", FCVAR_PROTECTED);
-	g_cvWebhookURL      = CreateConVar("calladmin_discord_webhook", "", "The webhook to the Discord channel where you want calladmin messages to be sent.", FCVAR_PROTECTED);
-	g_cvMention         = CreateConVar("calladmin_discord_mention", "@here", "Optional Discord mention to ping users when a calladmin is sent.");
-	g_cvBotUsername     = CreateConVar("calladmin_discord_username", "CallAdmin", "Username of the bot");
-	g_cvEmbedCallColor  = CreateConVar("calladmin_discord_call_embed_color", "0xff0000", "Color of the embed when a calladmin is made. Replace the usual '#' with '0x'.");
-	g_cvIP              = CreateConVar("calladmin_discord_ip", "0.0.0.0", "Set your server IP here when auto detection is not working for you. (Use 0.0.0.0 to disable manual override)");
-	g_cvHostname        = FindConVar("hostname");
-	g_cvHostname.GetString(g_szHostname, sizeof g_szHostname);
-
-	char szIP[32];
-	g_cvIP.GetString(szIP, sizeof szIP);
-
-	g_cvIP = FindConVar("ip");
-	g_cvIP.GetString(g_szIP, sizeof g_szIP);
-	if (StrEqual("0.0.0.0", g_szIP))
-	{
-		strcopy(g_szIP, sizeof g_szIP, szIP);
-	}
-	g_cvPort = FindConVar("hostport");
-	g_cvPort.GetString(g_szPort, sizeof g_szPort);
-
-	RelayHelper_PluginStart();
-	AutoExecConfig(true, PLUGIN_NAME);
-
-	RegAdminCmd("sm_calladmin_discordtest", CommandDiscordTest, ADMFLAG_ROOT, "Test the Discord announcement");
-
-	/* Incase of a late load */
-	for(int i = 1; i <= MaxClients; i++) {
-		if(!IsClientInGame(i) || IsFakeClient(i) || IsClientSourceTV(i) || g_sClientAvatar[i][0]) {
-			continue;
-		}
-
-		OnClientPostAdminCheck(i);
-	}
-}
-
-public void OnClientPostAdminCheck(int client) {
-	if(IsFakeClient(client) || IsClientSourceTV(client)) {
-		return;
-	}
-
-	GetClientSteamAvatar(client);
-}
-
-public void OnClientDisconnect(int client) {
-	g_sClientAvatar[client][0] = '\0';
-}
-
-#if defined _sourcebanspp_included
-public void SBPP_OnBanPlayer(int admin, int target, int length, const char[] reason) {
-	if(!g_Sbpp.enable.BoolValue) {
-		return;
-	}
-
-	if(admin < 1) {
-		return;
-	}
-
-	int bansNumber = 0;
-	int commsNumber = 0;
-
-	#if defined _sourcebanschecker_included
-	bansNumber = SBPP_CheckerGetClientsBans(target);
-	commsNumber = SBPP_CheckerGetClientsComms(target);
-	bansNumber++;
-	#endif
-
-	SendDiscordMessage(g_Sbpp, Message_Type_Ban, admin, target, length, reason, bansNumber, commsNumber, _, g_sClientAvatar[target]);
-	PrintToServer("[Sourcebans-Discord] Ban Player: Admin=%d, Target=%d, Length=%d, Reason=%s", admin, target, length, reason);
-}
-#endif
-
-#if defined _sourcecomms_included
-public void SourceComms_OnBlockAdded(int admin, int target, int length, int commType, char[] reason) {
-	if(!g_Sbpp.enable.BoolValue) {
-		return;
-	}
-
-	if(admin < 1) {
-		return;
-	}
-
-	MessageType type = Message_Type_Ban;
-	switch(commType) {
-		case TYPE_MUTE: {
-			type = Message_Type_Mute;
-		}
-
-		case TYPE_UNMUTE: {
-			type = Message_Type_Unmute;
-		}
-
-		case TYPE_GAG: {
-			type = Message_Type_Gag;
-		}
-
-		case TYPE_UNGAG: {
-			type = Message_Type_Ungag;
-		}
-	}
-
-	if(type == Message_Type_Ban) {
-		return;
-	}
-
-	int bansNumber = 0;
-	int commsNumber = 0;
-
-	#if defined _sourcebanschecker_included
-	bansNumber = SBPP_CheckerGetClientsBans(target);
-	commsNumber = SBPP_CheckerGetClientsComms(target);
-	commsNumber++;
-	#endif
-
-	SendDiscordMessage(g_Sbpp, type, admin, target, length, reason, bansNumber, commsNumber, _, g_sClientAvatar[target]);
-	PrintToServer("[Sourcebans-Discord] Block Added: Admin=%d, Target=%d, Length=%d, CommType=%d, Reason=%s", admin, target, length, commType, reason);
-}
-#endif
-
-public Action CommandDiscordTest(int client, int args)
+public void OnPluginStart()
 {
-    CPrintToChat(client, "{blue}[CallAdmin-Discord] Sending test message.");
-    CallAdmin_OnReportPost(client, client, "This is the reason");
-    CPrintToChat(client, "{blue}[CallAdmin-Discord] Test message sent.");
-    return Plugin_Handled;
+	CreateConVar("sbpp_discord_version", PLUGIN_VERSION, "SBPP Discord Version", FCVAR_REPLICATED | FCVAR_SPONLY | FCVAR_DONTRECORD | FCVAR_NOTIFY);
+
+	Convars[Ban] = CreateConVar("sbpp_discord_banhook", "", "Discord web hook endpoint for ban forward", FCVAR_PROTECTED);
+
+	Convars[Report] = CreateConVar("sbpp_discord_reporthook", "", "Discord web hook endpoint for report forward. If left empty, the ban endpoint will be used instead", FCVAR_PROTECTED);
+
+	Convars[Comms] = CreateConVar("sbpp_discord_commshook", "", "Discord web hook endpoint for comms forward. If left empty, the ban endpoint will be used instead", FCVAR_PROTECTED);
+
+	Convars[CallAdmin] = CreateConVar("calladmin_discord_webhook", "", "The webhook to the Discord channel where you want calladmin messages to be sent.", FCVAR_PROTECTED);
+
+	WebsiteBaseURL = CreateConVar("sbpp_website_url", "", "The base url of your website. Leave empty to disable");
+
+	Username = CreateConVar("sbpp_discord_username", "Sourcebans++", "The username of the webhook");
+
+	ProfilePictureURL = CreateConVar("sbpp_discord_pp_url", "https://sbpp.github.io/img/favicons/android-chrome-512x512.png", "A URL pointing to the profile picture for the webhook.");
+
+	CallAdminMention = CreateConVar("calladmin_discord_mention", "@here", "Optional Discord mention to ping users when a calladmin is sent.");
+
+	CallAdminUsername = CreateConVar("calladmin_discord_username", "CallAdmin", "Username of the bot");
+
+	CallAdminEmbedColor = CreateConVar("calladmin_discord_call_embed_color", "0xff0000", "Color of the embed when a calladmin is made. Replace the usual '#' with '0x'.");
+
+	AutoExecConfig(true, "sbpp_discord");
+
+	Convars[Ban].AddChangeHook(OnConvarChanged);
+	Convars[Report].AddChangeHook(OnConvarChanged);
+	Convars[Comms].AddChangeHook(OnConvarChanged);
+	Convars[CallAdmin].AddChangeHook(OnConvarChanged);
+}
+
+public void OnConfigsExecuted()
+{
+	FindConVar("hostname").GetString(sHostname, sizeof sHostname);
+
+	int ip[4];
+
+	SteamWorks_GetPublicIP(ip);
+
+	if (SteamWorks_GetPublicIP(ip))
+	{
+		Format(sHost, sizeof sHost, "%d.%d.%d.%d:%d", ip[0], ip[1], ip[2], ip[3], FindConVar("hostport").IntValue);
+	}
+	else
+	{
+		int iIPB = FindConVar("hostip").IntValue;
+		Format(sHost, sizeof sHost, "%d.%d.%d.%d:%d", iIPB >> 24 & 0x000000FF, iIPB >> 16 & 0x000000FF, iIPB >> 8 & 0x000000FF, iIPB & 0x000000FF, FindConVar("hostport").IntValue);
+	}
+
+	Convars[Ban].GetString(sEndpoints[Ban], sizeof sEndpoints[]);
+	Convars[Report].GetString(sEndpoints[Report], sizeof sEndpoints[]);
+	Convars[Comms].GetString(sEndpoints[Comms], sizeof sEndpoints[]);
+	Convars[CallAdmin].GetString(sEndpoints[CallAdmin], sizeof sEndpoints[]);
+}
+
+public void SBPP_OnBanPlayer(int iAdmin, int iTarget, int iTime, const char[] sReason)
+{
+	SendReport(iAdmin, iTarget, sReason, Ban, iTime);
+}
+
+public void SourceComms_OnBlockAdded(int iAdmin, int iTarget, int iTime, int iCommType, char[] sReason)
+{
+	SendReport(iAdmin, iTarget, sReason, Comms, iTime, iCommType);
+}
+
+public void SBPP_OnReportPlayer(int iReporter, int iTarget, const char[] sReason)
+{
+	SendReport(iReporter, iTarget, sReason, Report);
 }
 
 public void CallAdmin_OnReportPost(int iClient, int iTarget, const char[] szReason)
 {
-    char webhook[1024];
-    GetConVarString(g_cvWebhookURL, webhook, sizeof webhook);
-    if (StrEqual(webhook, ""))
-    {
-        PrintToServer("[CallAdmin-Discord] No webhook specified, aborting.");
-        return;
-    }
-    Webhook hook = new Webhook();
-    char szMention[128];
-    GetConVarString(g_cvMention, szMention, sizeof szMention);
-    if (!StrEqual(szMention, ""))
-    {
-        hook.SetContent(szMention);
-    }
-    char szCalladminName[64];
-    GetConVarString(g_cvBotUsername, szCalladminName, sizeof szCalladminName);
-    hook.SetUsername(szCalladminName);
-    Embed embed = new Embed();
-    char color[16];
-    GetConVarString(g_cvEmbedCallColor, color, sizeof color);
-    embed.SetColor(StringToInt(color, 16));
-    char szTitle[256];
-    Format(szTitle, sizeof szTitle, "CallAdmin - %s", szReason);
-    embed.SetTitle(szTitle);
-    char szClientID[256], szTargetID[256], szSteamClientID[64], szSteamTargetID[64], szNameClient[MAX_NAME_LENGTH], szNameTarget[MAX_NAME_LENGTH];
-    GetClientName(iClient, szNameClient, sizeof szNameClient);
-    GetClientAuthId(iClient, AuthId_SteamID64, szSteamClientID, sizeof szSteamClientID);
-    Format(szClientID, sizeof szClientID, "[%s](https://steamcommunity.com/profiles/%s)", szNameClient, szSteamClientID);
-    GetClientName(iTarget, szNameTarget, sizeof szNameTarget);
-    GetClientAuthId(iTarget, AuthId_SteamID64, szSteamTargetID, sizeof szSteamTargetID);
-    Format(szTargetID, sizeof szTargetID, "[%s](https://steamcommunity.com/profiles/%s)", szNameTarget, szSteamTargetID);
-    EmbedField field = new EmbedField("Reporter", szClientID, true);
-    embed.AddField(field);
-    field = new EmbedField("Target", szTargetID, true);
-    embed.AddField(field);
-    char szServerInfo[256];
-    Format(szServerInfo, sizeof szServerInfo, "**Connect IP: %s:%s**", g_szIP, g_szPort);
-    field = new EmbedField("Connect IP", szServerInfo, false);
-    embed.AddField(field);
-    EmbedFooter footer = new EmbedFooter();
-    char buffer[1000];
-    Format(buffer, sizeof buffer, "%s", g_szHostname);
-    footer.SetText(buffer);
-    embed.SetFooter(footer);
-    hook.AddEmbed(embed);
-    if (g_bDebugging)
-    {
-        char szDebugOutput[10000];
-        hook.ToString(szDebugOutput, sizeof szDebugOutput);
-        PrintToServer(szDebugOutput);
-    }
-    hook.Execute(webhook, OnWebHookExecuted, iClient);
-    delete hook;
+	SendReport(iClient, iTarget, szReason, CallAdmin);
+}
+
+void SendReport(int iClient, int iTarget, const char[] sReason, int iType = Ban, int iTime = -1, any extra = 0)
+{
+	if (iTarget != -1 && !IsValidClient(iTarget))
+		return;
+
+	char sEndpoint[256];
+	GetEndpoint(sEndpoint, sizeof sEndpoint, iType);
+
+	if (StrEqual(sEndpoint, ""))
+	{
+		LogError("Missing webhook endpoint for type %d", iType);
+		return;
+	}
+
+	char sAuthor[MAX_NAME_LENGTH],
+		sTarget[MAX_NAME_LENGTH],
+		sAuthorID[32],
+		sTargetID64[32],
+		sTargetID[32],
+		sJson[2048],
+		sBuffer[256],
+		szUsername[128],
+		szProfilePictureURL[256];
+
+	GetConVarString(ProfilePictureURL, szProfilePictureURL, sizeof szProfilePictureURL);
+	GetConVarString(Username, szUsername, sizeof szUsername);
+
+	if (IsValidClient(iClient))
+	{
+		GetClientName(iClient, sAuthor, sizeof sAuthor);
+		GetClientAuthId(iClient, AuthId_Steam2, sAuthorID, sizeof sAuthorID);
+	}
+	else
+	{
+		Format(sAuthor, sizeof sAuthor, "CONSOLE");
+		Format(sAuthorID, sizeof sAuthorID, "N/A");
+	}
+
+	GetClientAuthId(iTarget, AuthId_SteamID64, sTargetID64, sizeof sTargetID64);
+	GetClientName(iTarget, sTarget, sizeof sTarget);
+	GetClientAuthId(iTarget, AuthId_Steam2, sTargetID, sizeof sTargetID);
+
+	Handle jRequest = json_object();
+
+	Handle jEmbeds = json_array();
+
+	Handle jContent = json_object();
+
+	json_object_set(jContent, "color", json_integer(GetEmbedColor(iType)));
+
+	char szURLBuffer[512];
+	GetConVarString(WebsiteBaseURL, szURLBuffer, sizeof(szURLBuffer));
+
+	if (!StrEqual(szURLBuffer, ""))
+	{
+		json_object_set(jContent, "title", json_string("View on Sourcebans"));
+
+		if (iType == Comms)
+			Format(sBuffer, sizeof sBuffer, "%s/index.php?p=commslist&searchText=%s", szURLBuffer, sTargetID);
+		else if (iType == Ban)
+			Format(sBuffer, sizeof sBuffer, "%s/index.php?p=banlist&searchText=%s", szURLBuffer, sTargetID);
+		else if (iType == Report)
+			Format(sBuffer, sizeof sBuffer, "%s/index.php?p=admin&c=bans#^2", szURLBuffer);
+		else if (iType == CallAdmin)
+			Format(sBuffer, sizeof sBuffer, "%s/index.php?p=admin&c=bans#^2", szURLBuffer);
+		json_object_set(jContent, "url", json_string(sBuffer));
+	}
+
+	Handle jContentAuthor = json_object();
+
+	json_object_set_new(jContentAuthor, "name", json_string(sTarget));
+	Format(sBuffer, sizeof sBuffer, "https://steamcommunity.com/profiles/%s", sTargetID64);
+	json_object_set_new(jContentAuthor, "url", json_string(sBuffer));
+	json_object_set_new(jContentAuthor, "icon_url", json_string(szProfilePictureURL));
+	json_object_set_new(jContent, "author", jContentAuthor);
+
+	Handle jContentFooter = json_object();
+
+	Format(sBuffer, sizeof sBuffer, "%s (%s)", sHostname, sHost);
+	json_object_set_new(jContentFooter, "text", json_string(sBuffer));
+	json_object_set_new(jContentFooter, "icon_url", json_string(szProfilePictureURL));
+	json_object_set_new(jContent, "footer", jContentFooter);
+
+	Handle jFields = json_array();
+
+	Handle jFieldAuthor = json_object();
+	json_object_set_new(jFieldAuthor, "name", json_string("Author"));
+	Format(sBuffer, sizeof sBuffer, "%s", sAuthor);
+	json_object_set_new(jFieldAuthor, "value", json_string(sBuffer));
+	json_object_set_new(jFieldAuthor, "inline", json_boolean(true));
+
+	Handle jFieldTarget = json_object();
+	json_object_set_new(jFieldTarget, "name", json_string("Target"));
+	Format(sBuffer, sizeof sBuffer, "%s (%s)", sTarget, sTargetID);
+	json_object_set_new(jFieldTarget, "value", json_string(sBuffer));
+	json_object_set_new(jFieldTarget, "inline", json_boolean(true));
+
+	Handle jFieldReason = json_object();
+	json_object_set_new(jFieldReason, "name", json_string("Reason"));
+	json_object_set_new(jFieldReason, "value", json_string(sReason));
+
+	json_array_append_new(jFields, jFieldAuthor);
+	json_array_append_new(jFields, jFieldTarget);
+
+	if (iType == Ban || iType == Comms)
+	{
+		Handle jFieldDuration = json_object();
+
+		json_object_set_new(jFieldDuration, "name", json_string("Duration"));
+
+		if (iTime > 0)
+			Format(sBuffer, sizeof sBuffer, "%d Minutes", iTime);
+		else if (iTime < 0)
+			Format(sBuffer, sizeof sBuffer, "Session");
+		else
+			Format(sBuffer, sizeof sBuffer, "Permanent");
+
+		json_object_set_new(jFieldDuration, "value", json_string(sBuffer));
+
+		json_array_append_new(jFields, jFieldDuration);
+	}
+
+	if (iType == Comms)
+	{
+		Handle jFieldCommType = json_object();
+
+		json_object_set_new(jFieldCommType, "name", json_string("Comm Type"));
+
+		char cType[32];
+
+		GetCommType(cType, sizeof cType, extra);
+
+		json_object_set_new(jFieldCommType, "value", json_string(cType));
+
+		json_array_append_new(jFields, jFieldCommType);
+	}
+
+	if (iType == CallAdmin)
+	{
+		char szMention[128];
+		GetConVarString(CallAdminMention, szMention, sizeof szMention);
+		if (!StrEqual(szMention, ""))
+		{
+			json_object_set_new(jRequest, "content", json_string(szMention));
+		}
+
+		char szCalladminName[64];
+		GetConVarString(CallAdminUsername, szCalladminName, sizeof szCalladminName);
+		json_object_set_new(jRequest, "username", json_string(szCalladminName));
+
+		char szEmbedColor[16];
+		GetConVarString(CallAdminEmbedColor, szEmbedColor, sizeof szEmbedColor);
+		json_object_set(jContent, "color", json_integer(StringToInt(szEmbedColor, 16)));
+	}
+
+	json_array_append_new(jFields, jFieldReason);
+
+	json_object_set_new(jContent, "fields", jFields);
+
+	json_array_append_new(jEmbeds, jContent);
+
+	json_object_set_new(jRequest, "username", json_string(szUsername));
+	json_object_set_new(jRequest, "avatar_url", json_string(szProfilePictureURL));
+	json_object_set_new(jRequest, "embeds", jEmbeds);
+
+	json_dump(jRequest, sJson, sizeof sJson, 0, false, false, true);
+
+	#if defined DEBUG
+		PrintToServer("JSON Payload: %s", sJson);
+	#endif
+
+	CloseHandle(jRequest);
+
+	Handle hRequest = SteamWorks_CreateHTTPRequest(k_EHTTPMethodPOST, sEndpoint);
+
+	if (!hRequest)
+	{
+		LogError("Failed to create HTTP request");
+		return;
+	}
+
+	SteamWorks_SetHTTPRequestContextValue(hRequest, iClient, iTarget);
+	SteamWorks_SetHTTPRequestGetOrPostParameter(hRequest, "payload_json", sJson);
+	SteamWorks_SetHTTPCallbacks(hRequest, OnHTTPRequestComplete);
+
+	if (!SteamWorks_SendHTTPRequest(hRequest))
+	{
+		LogError("HTTP request failed for %s against %s", sAuthor, sTarget);
+		CloseHandle(hRequest);
+	}
+}
+
+public int OnHTTPRequestComplete(Handle hRequest, bool bFailure, bool bRequestSuccessful, EHTTPStatusCode eStatusCode, int iClient, int iTarget)
+{
+	if (!bRequestSuccessful || eStatusCode != k_EHTTPStatusCode204NoContent)
+	{
+		LogError("HTTP request failed for %N against %N", iClient, iTarget);
+
+		#if defined DEBUG
+			int iSize;
+
+			SteamWorks_GetHTTPResponseBodySize(hRequest, iSize);
+
+			char[] sBody = new char[iSize];
+
+			SteamWorks_GetHTTPResponseBodyData(hRequest, sBody, iSize);
+
+			PrintToServer("Response Body: %s", sBody);
+			PrintToServer("Status Code: %d", eStatusCode);
+			PrintToServer("SteamWorks_IsLoaded: %d", SteamWorks_IsLoaded());
+		#endif
+	}
+	else
+	{
+		PrintToServer("HTTP request succeeded for %N against %N", iClient, iTarget);
+	}
+
+	CloseHandle(hRequest);
+}
+
+public void OnConvarChanged(ConVar convar, const char[] oldValue, const char[] newValue)
+{
+	if (convar == Convars[Ban])
+		Convars[Ban].GetString(sEndpoints[Ban], sizeof sEndpoints[]);
+	else if (convar == Convars[Report])
+		Convars[Report].GetString(sEndpoints[Report], sizeof sEndpoints[]);
+	else if (convar == Convars[Comms])
+		Convars[Comms].GetString(sEndpoints[Comms], sizeof sEndpoints[]);
+	else if (convar == Convars[CallAdmin])
+		Convars[CallAdmin].GetString(sEndpoints[CallAdmin], sizeof sEndpoints[]);
+}
+
+int GetEmbedColor(int iType)
+{
+	if (iType != Type_Unknown)
+		return EmbedColors[iType];
+
+	return EmbedColors[Ban];
+}
+
+void GetEndpoint(char[] sBuffer, int iBufferSize, int iType)
+{
+	if (!StrEqual(sEndpoints[iType], ""))
+	{
+		strcopy(sBuffer, iBufferSize, sEndpoints[iType]);
+		return;
+	}
+
+	strcopy(sBuffer, iBufferSize, sEndpoints[Ban]);
+}
+
+void GetCommType(char[] sBuffer, int iBufferSize, int iType)
+{
+	switch (iType)
+	{
+		case TYPE_MUTE:
+			strcopy(sBuffer, iBufferSize, "Mute");
+		case TYPE_GAG:
+			strcopy(sBuffer, iBufferSize, "Gag");
+		case TYPE_SILENCE:
+			strcopy(sBuffer, iBufferSize, "Silence");
+	}
+}
+
+stock bool IsValidClient(int iClient, bool bAlive = false)
+{
+	if (iClient >= 1 &&
+	iClient <= MaxClients &&
+	IsClientConnected(iClient) &&
+	IsClientInGame(iClient) &&
+	!IsFakeClient(iClient) &&
+	(bAlive == false || IsPlayerAlive(iClient)))
+	{
+		return true;
+	}
+
+	return false;
 }
