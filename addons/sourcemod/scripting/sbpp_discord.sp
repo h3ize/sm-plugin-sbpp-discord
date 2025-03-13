@@ -23,10 +23,10 @@ enum
 };
 
 int EmbedColors[Type_Count] = {
-	0xDA1D87, // Ban
-	0xF9D942, // Report
-	0x4362FA, // Comms
-	0xff0000, // CallAdmin
+    16711680, // Ban
+    16776960, // Report
+    11393254,  // Comms
+    16776960  // CallAdmin
 };
 
 ConVar Convars[Type_Count],
